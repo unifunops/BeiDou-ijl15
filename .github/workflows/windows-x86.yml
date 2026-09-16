@@ -1,0 +1,152 @@
+name: Build Windows x86 DLL
+
+on:
+  push:
+    branches: [BeiDou]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Normalize build-copy source encodings
+        shell: python
+        run: |
+          from pathlib import Path
+          for p in Path('ezorsia').rglob('*'):
+              if p.suffix.lower() not in ('.h', '.cpp'):
+                  continue
+              b = p.read_bytes()
+              if b.startswith((b'\xff\xfe', b'\xfe\xff')):
+                  text = b.decode('utf-16')
+              else:
+                  try:
+                      text = b.decode('utf-8-sig')
+                  except UnicodeDecodeError:
+                      text = b.decode('cp936')
+                      print(f'Decoded GBK source: {p}')
+              p.write_bytes(text.encode('utf-8-sig'))
+
+      - name: Build Release x86 using v142
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force build-logs | Out-Null
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vs) { throw 'Visual Studio was not found.' }
+          $tools = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory |
+            Where-Object { $_.Name -match '^14\.2\d\.' } |
+            Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          if (-not $tools) { throw 'MSVC v142 is required; no silent toolset upgrade is allowed.' }
+          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $sdk = Get-ChildItem "$sdkRoot\Include" -Directory |
+            Where-Object { (Test-Path "$($_.FullName)\shared\SDKDDKVer.h") -and (Test-Path "$sdkRoot\Lib\$($_.Name)\um\x86\kernel32.lib") } |
+            Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          if (-not $sdk) { throw 'Windows SDK with x86 libraries was not found.' }
+          "VS_PATH=$vs" >> $env:GITHUB_ENV
+          "TOOLS_PATH=$($tools.FullName)" >> $env:GITHUB_ENV
+          "SDK_VERSION=$($sdk.Name)" >> $env:GITHUB_ENV
+          $env:_CL_ = '/source-charset:utf-8 /execution-charset:.936 /D_CRT_SECURE_NO_WARNINGS'
+          @("Commit=$env:GITHUB_SHA", "MSVC=$($tools.Name)", "SDK=$($sdk.Name)", "CL=$env:_CL_", 'Target=Release x86 / v142 / MD') | Set-Content build-logs/environment.txt
+          & "$vs\MSBuild\Current\Bin\MSBuild.exe" ezorsia.sln /t:Rebuild /m /nologo /p:Configuration=Release /p:Platform=x86 /p:PlatformToolset=v142 "/p:VCToolsVersion=$($tools.Name)" "/p:WindowsTargetPlatformVersion=$($sdk.Name)" /v:minimal /fl '/flp:logfile=build-logs/msbuild.log;verbosity=normal;encoding=UTF-8'
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path out/Release/ijl15.dll)) { throw 'Compiler output DLL is missing.' }
+
+      - name: Verify DLL format and all six exports
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path 'out/Release/ijl15.dll'))
+          if ($bytes.Length -lt 64 -or [BitConverter]::ToUInt16($bytes, 0) -ne 0x5a4d) { throw 'Invalid DOS header.' }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($pe -lt 64 -or $pe -gt $bytes.Length - 26) { throw 'Invalid PE offset.' }
+          if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x4550) { throw 'Invalid PE signature.' }
+          if ([BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x14c) { throw 'Output is not x86.' }
+          if ([BitConverter]::ToUInt16($bytes, $pe + 24) -ne 0x10b) { throw 'Output is not PE32.' }
+          if (([BitConverter]::ToUInt16($bytes, $pe + 22) -band 0x2000) -eq 0) { throw 'Output is not a DLL.' }
+          $dumpbin = "$env:TOOLS_PATH\bin\Hostx64\x86\dumpbin.exe"
+          $exports = & $dumpbin /nologo /exports out/Release/ijl15.dll
+          if ($LASTEXITCODE -ne 0) { throw 'Export inspection failed.' }
+          $exports | Set-Content build-logs/exports.txt
+          foreach ($symbol in @('ijlErrorStr','ijlFree','ijlGetLibVersion','ijlInit','ijlRead','ijlWrite')) {
+            if (($exports -join "`n") -notmatch "(?m)\s$symbol(?:\s|$)") { throw "Missing export: $symbol" }
+          }
+          & $dumpbin /nologo /dependents out/Release/ijl15.dll | Set-Content build-logs/dependencies.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency inspection failed.' }
+          Write-Host 'PASS: PE32 x86 DLL, all six required exports present.'
+
+      - name: Package DLL, config, and app-local Visual C++ runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item out/Release/ijl15.dll package/
+          Copy-Item ezorsia/config.ini package/
+          Copy-Item LICENSE package/SOURCE-LICENSE.txt
+          $redist = Get-ChildItem "$env:VS_PATH\VC\Redist\MSVC" -Directory |
+            Where-Object { (Test-Path "$($_.FullName)\x86\Microsoft.VC142.CRT") } |
+            Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          if (-not $redist) { throw 'Redistributable x86 VC142 CRT was not found.' }
+          Copy-Item "$($redist.FullName)\x86\Microsoft.VC142.CRT\*.dll" package/
+          foreach ($required in @('vcruntime140.dll','msvcp140.dll')) {
+            if (-not (Test-Path "package/$required")) { throw "Missing runtime: $required" }
+          }
+          @'
+          BeiDou-ijl15 / Windows x86 / Release
+
+          安装前退出客户端并备份整个客户端目录。
+          1. 首次安装：将客户端原版 ijl15.dll 改名为 2ijl15.dll。
+             已有正常的原版 2ijl15.dll 时保留它，不要用补丁 DLL 覆盖它。
+          2. 将本包的 ijl15.dll 和附带的运行库 DLL 复制到客户端 EXE 同一目录。
+          3. 没有 config.ini 时复制本包的 config.ini；已有配置请先备份并保留自己的服务器设置。
+          4. 默认 ServerIP_Address=127.0.0.1，serverIP_Port=8484。
+             服务端不在本机时，需要改成自己的服务器地址与端口。
+          5. 启动原来的客户端 EXE；ijl15.dll 不是独立运行的 EXE。
+
+          本包不包含客户端原版 2ijl15.dll、客户端 EXE 或 WZ 游戏资源。
+          面向本仓库对应的 BeiDou 客户端，不保证其他客户端版本兼容。
+          已执行真实 MSVC 编译、PE32/x86 检查与导出符号检查。
+          未执行客户端登录或游戏内测试。不要在任意进程中 LoadLibrary 测试此补丁：
+          它的 DllMain 会修改目标客户端的固定内存地址。
+          运行库以 app-local 方式附带；UCRT 使用 Windows 自带版本。
+          旧版 Windows/Wine 仍可能需要额外配置，不代表已通过兼容性测试。
+
+          Microsoft 运行库不适用本项目的源码许可证；其权利归 Microsoft 所有。
+          项目源码许可证另见 SOURCE-LICENSE.txt。
+          '@ | Set-Content package/INSTALL-zh-CN.txt -Encoding utf8BOM
+          @("Repository=$env:GITHUB_REPOSITORY", "Commit=$env:GITHUB_SHA", "Run=$env:GITHUB_RUN_ID", "Toolset=v142", "SDK=$env:SDK_VERSION", 'Configuration=Release', 'Platform=x86', 'Runtime=/MD with app-local VC142 CRT', 'Checks=PE32 x86 DLL; six IJL exports', 'ClientRuntimeTest=NOT_PERFORMED') | Set-Content package/BUILD-INFO.txt
+          Get-ChildItem package -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content package/SHA256SUMS.txt -Encoding ascii
+          '## Release x86 build succeeded' >> $env:GITHUB_STEP_SUMMARY
+          'Download **BeiDou-ijl15-Windows-x86** below. Preserve the client original DLL as **2ijl15.dll** before installing. Client runtime compatibility has not been tested.' >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload ready-to-copy package
+        uses: actions/upload-artifact@v4
+        with:
+          name: BeiDou-ijl15-Windows-x86
+          path: package/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BeiDou-ijl15-build-diagnostics
+          path: |
+            build-logs/*
+            out/Release/*.pdb
+          if-no-files-found: warn
+          retention-days: 14
